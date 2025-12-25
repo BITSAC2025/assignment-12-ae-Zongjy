@@ -26,7 +26,8 @@ void AbstractExecution::updateStateOnCopy(const CopyStmt *copy)
     AbstractState &as = getAbsStateFromTrace(node);
     auto lhs = copy->getLHSVarID();
     auto rhs = copy->getRHSVarID();
-    // TODO: your code starts from here
+    // Copy the value from rhs to lhs
+    as[lhs] = as[rhs];
 }
 
 
@@ -36,7 +37,14 @@ void AbstractExecution::updateStateOnStore(const StoreStmt *store)
     AbstractState &as = getAbsStateFromTrace(node);
     auto lhs = store->getLHSVarID();
     auto rhs = store->getRHSVarID();
-    // TODO: your code starts from here
+    // Store: *lhs = rhs, store the value of rhs to the memory location pointed by lhs
+    if (as.inVarToAddrsTable(lhs))
+    {
+        for (const auto &addr : as[lhs].getAddrs())
+        {
+            as.store(addr, as[rhs]);
+        }
+    }
 }
 
 
@@ -46,7 +54,16 @@ void AbstractExecution::updateStateOnLoad(const LoadStmt *load)
     AbstractState &as = getAbsStateFromTrace(node);
     auto lhs = load->getLHSVarID();
     auto rhs = load->getRHSVarID();
-    // TODO: your code starts from here
+    // Load: lhs = *rhs, load the value from the memory location pointed by rhs
+    if (as.inVarToAddrsTable(rhs))
+    {
+        AbstractValue res;
+        for (const auto &addr : as[rhs].getAddrs())
+        {
+            res.join_with(as.load(addr));
+        }
+        as[lhs] = res;
+    }
 }
 
 
@@ -55,7 +72,11 @@ void AbstractExecution::updateStateOnGep(const GepStmt *gep)
     AbstractState &as = getAbsStateFromTrace(gep->getICFGNode());
     u32_t rhs = gep->getRHSVarID();
     u32_t lhs = gep->getLHSVarID();
-    // TODO: your code starts from here
+    // GEP (Get Element Pointer): calculate the address of a field/element
+    // Get the byte offset from the GEP statement
+    IntervalValue offset = as.getByteOffset(gep);
+    // Get the new addresses with the offset applied
+    as[lhs] = as.getGepObjAddrs(rhs, offset);
 }
 
 
@@ -65,7 +86,13 @@ void AbstractExecution::updateStateOnPhi(const PhiStmt *phi)
     AbstractState &as = getAbsStateFromTrace(icfgNode);
     u32_t res = phi->getResID();
     auto rhs = AbstractValue();
-    // TODO: your code starts from here
+    // Phi node: join values from all incoming edges
+    for (u32_t i = 0; i < phi->getOpVarNum(); i++)
+    {
+        NodeID opVarId = phi->getOpVarID(i);
+        rhs.join_with(as[opVarId]);
+    }
+    as[res] = rhs;
 }
 
 
@@ -86,23 +113,23 @@ void AbstractExecution::updateStateOnBinary(const BinaryOPStmt *binary)
 
     if (opCode == BinaryOPStmt::Add || opCode == BinaryOPStmt::FAdd)
     {
-        // TODO: handle add
+        resVal = lhs + rhs;
     }
     else if (opCode == BinaryOPStmt::Sub || opCode == BinaryOPStmt::FSub)
     {
-        // TODO: handle subtraction
+        resVal = lhs - rhs;
     }
     else if (opCode == BinaryOPStmt::Mul || opCode == BinaryOPStmt::FMul)
     {
-        // TODO: handle multiplication
+        resVal = lhs * rhs;
     }
     else if (opCode == BinaryOPStmt::SDiv || opCode == BinaryOPStmt::FDiv || opCode == BinaryOPStmt::UDiv)
     {
-        // TODO: handle division
+        resVal = lhs / rhs;
     }
     else if (opCode == BinaryOPStmt::SRem || opCode == BinaryOPStmt::FRem || opCode == BinaryOPStmt::URem)
     {
-        // TODO: handle remainder
+        resVal = lhs % rhs;
     }
     else if (opCode == BinaryOPStmt::Xor)
     {
@@ -136,7 +163,46 @@ void AbstractExecution::handleCycleWTO(const ICFGCycleWTO *cycle)
     // Infinite loop until a fixpoint is reached,
     for (u32_t cur_iter = 0;; cur_iter++)
     {
-        // TODO: your code start from here
+        // Save the previous state of the cycle head before merging
+        AbstractState prevState = preAbsTrace[cycle_head];
+
+        // Merge states from all predecessors of the cycle head
+        if (!mergeStatesFromPredecessors(cycle_head, preAbsTrace[cycle_head]))
+        {
+            // If no feasible incoming state, exit
+            break;
+        }
+
+        // Copy pre-state to post-state
+        postAbsTrace[cycle_head] = preAbsTrace[cycle_head];
+
+        // Process all statements in the cycle head node
+        for (const SVFStmt *stmt : cycle_head->getSVFStmts())
+        {
+            updateAbsState(stmt);
+        }
+
+        // Handle call sites if the cycle head is a call node
+        if (const CallICFGNode *callnode = SVFUtil::dyn_cast<CallICFGNode>(cycle_head))
+        {
+            handleCallSite(callnode);
+        }
+
+        // Process the cycle body (all components inside the cycle)
+        handleWTOComponents(cycle->getWTOComponents());
+
+        // Check for fixpoint: if the state hasn't changed, we've reached convergence
+        if (preAbsTrace[cycle_head].equals(prevState))
+        {
+            break;
+        }
+
+        // Apply widening to ensure termination
+        // After a certain number of iterations, we need to widen to guarantee convergence
+        if (increasing && cur_iter >= Options::WidenDelay())
+        {
+            preAbsTrace[cycle_head] = preAbsTrace[cycle_head].widening(prevState);
+        }
     }
 }
 
